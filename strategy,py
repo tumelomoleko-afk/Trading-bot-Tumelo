@@ -1,0 +1,944 @@
+"""
+SMC / ICT Strategy Engine
+-------------------------
+Paper-trading / backtesting only.
+
+The engine produces a setup-quality score.
+A score of 95/100 does NOT mean a 95% probability of profit.
+
+The engine looks for:
+- Liquidity sweeps
+- Market structure
+- BOS / CHOCH proxy
+- Fair Value Gaps
+- Displacement
+- Order blocks
+- Higher-timeframe bias
+- Trading session
+"""
+
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from typing import List, Optional, Dict, Any
+
+
+# ============================================================
+# DATA MODELS
+# ============================================================
+
+@dataclass
+class Candle:
+    timestamp: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float = 0.0
+
+
+@dataclass
+class FVG:
+    direction: str
+    high: float
+    low: float
+    index: int
+
+
+@dataclass
+class Signal:
+    direction: str
+    score: int
+
+    entry: float
+    stop_loss: float
+    take_profit: float
+
+    risk_distance: float
+    reward_distance: float
+    risk_reward: float
+
+    timestamp: datetime
+
+    flags: Dict[str, bool]
+    reasons: List[str]
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = asdict(self)
+        data["timestamp"] = self.timestamp.isoformat()
+        return data
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+DEFAULT_CONFIG = {
+    "swing_window": 3,
+    "liquidity_lookback": 40,
+    "atr_period": 14,
+    "minimum_score": 90,
+    "risk_reward": 2.0,
+    "displacement_atr_multiplier": 1.25,
+
+    # UTC session
+    "session_start": 7,
+    "session_end": 20,
+}
+
+
+# ============================================================
+# BASIC CANDLE FUNCTIONS
+# ============================================================
+
+def candle_body(candle: Candle) -> float:
+    return abs(candle.close - candle.open)
+
+
+def candle_range(candle: Candle) -> float:
+    return candle.high - candle.low
+
+
+def bullish(candle: Candle) -> bool:
+    return candle.close > candle.open
+
+
+def bearish(candle: Candle) -> bool:
+    return candle.close < candle.open
+
+
+# ============================================================
+# ATR
+# ============================================================
+
+def calculate_atr(
+    candles: List[Candle],
+    period: int = 14
+) -> Optional[float]:
+
+    if len(candles) < period + 1:
+        return None
+
+    true_ranges = []
+
+    for i in range(1, len(candles)):
+        current = candles[i]
+        previous = candles[i - 1]
+
+        tr = max(
+            current.high - current.low,
+            abs(current.high - previous.close),
+            abs(current.low - previous.close)
+        )
+
+        true_ranges.append(tr)
+
+    recent = true_ranges[-period:]
+
+    if not recent:
+        return None
+
+    return sum(recent) / len(recent)
+
+
+# ============================================================
+# EMA
+# ============================================================
+
+def ema(values: List[float], period: int) -> Optional[float]:
+
+    if len(values) < period:
+        return None
+
+    multiplier = 2 / (period + 1)
+
+    current_ema = sum(values[:period]) / period
+
+    for value in values[period:]:
+        current_ema = (
+            (value - current_ema) * multiplier
+        ) + current_ema
+
+    return current_ema
+
+
+# ============================================================
+# SWING DETECTION
+# ============================================================
+
+def is_swing_high(
+    candles: List[Candle],
+    index: int,
+    window: int
+) -> bool:
+
+    if index - window < 0:
+        return False
+
+    if index + window >= len(candles):
+        return False
+
+    current_high = candles[index].high
+
+    for i in range(
+        index - window,
+        index + window + 1
+    ):
+        if i == index:
+            continue
+
+        if candles[i].high >= current_high:
+            return False
+
+    return True
+
+
+def is_swing_low(
+    candles: List[Candle],
+    index: int,
+    window: int
+) -> bool:
+
+    if index - window < 0:
+        return False
+
+    if index + window >= len(candles):
+        return False
+
+    current_low = candles[index].low
+
+    for i in range(
+        index - window,
+        index + window + 1
+    ):
+        if i == index:
+            continue
+
+        if candles[i].low <= current_low:
+            return False
+
+    return True
+
+
+def recent_swing_levels(
+    candles: List[Candle],
+    current_index: int,
+    window: int,
+    lookback: int
+):
+
+    highs = []
+    lows = []
+
+    start = max(
+        window,
+        current_index - lookback
+    )
+
+    # Only use CONFIRMED swings.
+    # This prevents future candles from leaking
+    # into the current signal.
+
+    end = current_index - window
+
+    if end <= start:
+        return highs, lows
+
+    for i in range(start, end):
+
+        if is_swing_high(
+            candles,
+            i,
+            window
+        ):
+            highs.append(
+                candles[i].high
+            )
+
+        if is_swing_low(
+            candles,
+            i,
+            window
+        ):
+            lows.append(
+                candles[i].low
+            )
+
+    return highs, lows
+
+
+# ============================================================
+# LIQUIDITY SWEEP
+# ============================================================
+
+def detect_liquidity_sweep(
+    candles: List[Candle],
+    index: int,
+    config: dict
+):
+
+    if index <= 0:
+        return None
+
+    window = config["swing_window"]
+    lookback = config["liquidity_lookback"]
+
+    highs, lows = recent_swing_levels(
+        candles,
+        index,
+        window,
+        lookback
+    )
+
+    if not highs and not lows:
+        return None
+
+    current = candles[index]
+
+    # Bearish liquidity sweep:
+    # Price takes previous highs then closes back below.
+    if highs:
+
+        previous_high = max(highs)
+
+        if (
+            current.high > previous_high
+            and current.close < previous_high
+        ):
+            return "bearish"
+
+    # Bullish liquidity sweep:
+    # Price takes previous lows then closes back above.
+    if lows:
+
+        previous_low = min(lows)
+
+        if (
+            current.low < previous_low
+            and current.close > previous_low
+        ):
+            return "bullish"
+
+    return None
+
+
+# ============================================================
+# DISPLACEMENT
+# ============================================================
+
+def detect_displacement(
+    candles: List[Candle],
+    index: int,
+    config: dict
+):
+
+    atr = calculate_atr(
+        candles[:index + 1],
+        config["atr_period"]
+    )
+
+    if atr is None:
+        return None
+
+    current = candles[index]
+
+    body = candle_body(current)
+
+    required_body = (
+        atr *
+        config["displacement_atr_multiplier"]
+    )
+
+    if body < required_body:
+        return None
+
+    if bullish(current):
+        return "bullish"
+
+    if bearish(current):
+        return "bearish"
+
+    return None
+
+
+# ============================================================
+# FAIR VALUE GAP
+# ============================================================
+
+def detect_fvg(
+    candles: List[Candle],
+    index: int
+):
+
+    if index < 2:
+        return None
+
+    first = candles[index - 2]
+    middle = candles[index - 1]
+    third = candles[index]
+
+    # Bullish FVG
+    if third.low > first.high:
+
+        return FVG(
+            direction="bullish",
+            high=third.low,
+            low=first.high,
+            index=index
+        )
+
+    # Bearish FVG
+    if third.high < first.low:
+
+        return FVG(
+            direction="bearish",
+            high=first.low,
+            low=third.high,
+            index=index
+        )
+
+    return None
+
+
+# ============================================================
+# MARKET STRUCTURE
+# ============================================================
+
+def detect_structure_break(
+    candles: List[Candle],
+    index: int,
+    config: dict
+):
+
+    if index <= 1:
+        return None
+
+    window = config["swing_window"]
+    lookback = config["liquidity_lookback"]
+
+    highs, lows = recent_swing_levels(
+        candles,
+        index,
+        window,
+        lookback
+    )
+
+    current = candles[index]
+
+    # Bullish BOS proxy
+    if highs:
+
+        previous_high = max(highs)
+
+        if current.close > previous_high:
+            return "bullish"
+
+    # Bearish BOS proxy
+    if lows:
+
+        previous_low = min(lows)
+
+        if current.close < previous_low:
+            return "bearish"
+
+    return None
+
+
+# ============================================================
+# HIGHER TIMEFRAME BIAS
+# ============================================================
+
+def higher_timeframe_bias(
+    candles: List[Candle]
+):
+
+    if len(candles) < 60:
+        return None
+
+    closes = [
+        candle.close
+        for candle in candles
+    ]
+
+    ema20 = ema(closes, 20)
+    ema60 = ema(closes, 60)
+
+    if ema20 is None or ema60 is None:
+        return None
+
+    if ema20 > ema60:
+        return "bullish"
+
+    if ema20 < ema60:
+        return "bearish"
+
+    return None
+
+
+# ============================================================
+# SESSION FILTER
+# ============================================================
+
+def in_session(
+    timestamp: datetime,
+    config: dict
+) -> bool:
+
+    hour = timestamp.hour
+
+    start = config["session_start"]
+    end = config["session_end"]
+
+    return start <= hour <= end
+
+
+# ============================================================
+# ORDER BLOCK PROXY
+# ============================================================
+
+def detect_order_block(
+    candles: List[Candle],
+    index: int,
+    direction: str
+):
+
+    if index < 1:
+        return False
+
+    previous = candles[index - 1]
+
+    if direction == "bullish":
+
+        return bearish(previous)
+
+    if direction == "bearish":
+
+        return bullish(previous)
+
+    return False
+
+
+# ============================================================
+# ENTRY / SL / TP
+# ============================================================
+
+def calculate_trade_levels(
+    candles: List[Candle],
+    index: int,
+    direction: str,
+    config: dict
+):
+
+    current = candles[index]
+
+    entry = current.close
+
+    atr = calculate_atr(
+        candles[:index + 1],
+        config["atr_period"]
+    )
+
+    if atr is None:
+        atr = candle_range(current)
+
+    if atr <= 0:
+        return None
+
+    if direction == "bullish":
+
+        stop_loss = current.low - (
+            atr * 0.25
+        )
+
+        risk = entry - stop_loss
+
+        take_profit = entry + (
+            risk * config["risk_reward"]
+        )
+
+    else:
+
+        stop_loss = current.high + (
+            atr * 0.25
+        )
+
+        risk = stop_loss - entry
+
+        take_profit = entry - (
+            risk * config["risk_reward"]
+        )
+
+    if risk <= 0:
+        return None
+
+    reward = abs(
+        take_profit - entry
+    )
+
+    rr = reward / risk
+
+    return {
+        "entry": entry,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+        "risk_distance": risk,
+        "reward_distance": reward,
+        "risk_reward": rr,
+    }
+
+
+# ============================================================
+# SIGNAL ENGINE
+# ============================================================
+
+def detect_signal(
+    candles: List[Candle],
+    index: Optional[int] = None,
+    config: Optional[dict] = None
+):
+
+    if config is None:
+        config = DEFAULT_CONFIG.copy()
+
+    if index is None:
+        index = len(candles) - 1
+
+    minimum_required = max(
+        config["atr_period"] + 1,
+        65
+    )
+
+    if len(candles) < minimum_required:
+        return None
+
+    if index < minimum_required - 1:
+        return None
+
+    current = candles[index]
+
+    score = 0
+
+    flags = {
+        "liquidity_sweep": False,
+        "displacement": False,
+        "structure_break": False,
+        "fvg": False,
+        "htf_bias": False,
+        "order_block": False,
+        "session": False,
+    }
+
+    reasons = []
+
+    # --------------------------------------------------------
+    # LIQUIDITY
+    # --------------------------------------------------------
+
+    sweep = detect_liquidity_sweep(
+        candles,
+        index,
+        config
+    )
+
+    if sweep:
+
+        flags["liquidity_sweep"] = True
+
+        score += 20
+
+        reasons.append(
+            f"{sweep.title()} liquidity sweep"
+        )
+
+    # --------------------------------------------------------
+    # DISPLACEMENT
+    # --------------------------------------------------------
+
+    displacement = detect_displacement(
+        candles,
+        index,
+        config
+    )
+
+    if displacement:
+
+        flags["displacement"] = True
+
+        score += 15
+
+        reasons.append(
+            f"{displacement.title()} displacement"
+        )
+
+    # --------------------------------------------------------
+    # STRUCTURE
+    # --------------------------------------------------------
+
+    structure = detect_structure_break(
+        candles,
+        index,
+        config
+    )
+
+    if structure:
+
+        flags["structure_break"] = True
+
+        score += 20
+
+        reasons.append(
+            f"{structure.title()} structure break"
+        )
+
+    # --------------------------------------------------------
+    # FVG
+    # --------------------------------------------------------
+
+    fvg = detect_fvg(
+        candles,
+        index
+    )
+
+    if fvg:
+
+        flags["fvg"] = True
+
+        score += 15
+
+        reasons.append(
+            f"{fvg.direction.title()} FVG"
+        )
+
+    # --------------------------------------------------------
+    # HTF BIAS
+    # --------------------------------------------------------
+
+    bias = higher_timeframe_bias(
+        candles[:index + 1]
+    )
+
+    if bias:
+
+        flags["htf_bias"] = True
+
+        score += 15
+
+        reasons.append(
+            f"{bias.title()} higher-timeframe bias"
+        )
+
+    # --------------------------------------------------------
+    # ORDER BLOCK
+    # --------------------------------------------------------
+
+    possible_direction = (
+        sweep
+        or displacement
+        or structure
+    )
+
+    if possible_direction:
+
+        ob = detect_order_block(
+            candles,
+            index,
+            possible_direction
+        )
+
+        if ob:
+
+            flags["order_block"] = True
+
+            score += 5
+
+            reasons.append(
+                f"{possible_direction.title()} order block"
+            )
+
+    # --------------------------------------------------------
+    # SESSION
+    # --------------------------------------------------------
+
+    if in_session(
+        current.timestamp,
+        config
+    ):
+
+        flags["session"] = True
+
+        score += 5
+
+        reasons.append(
+            "Active trading session"
+        )
+
+    # --------------------------------------------------------
+    # DETERMINE DIRECTION
+    # --------------------------------------------------------
+
+    bullish_points = 0
+    bearish_points = 0
+
+    if sweep == "bullish":
+        bullish_points += 2
+
+    if sweep == "bearish":
+        bearish_points += 2
+
+    if displacement == "bullish":
+        bullish_points += 2
+
+    if displacement == "bearish":
+        bearish_points += 2
+
+    if structure == "bullish":
+        bullish_points += 2
+
+    if structure == "bearish":
+        bearish_points += 2
+
+    if fvg:
+
+        if fvg.direction == "bullish":
+            bullish_points += 1
+
+        if fvg.direction == "bearish":
+            bearish_points += 1
+
+    if bias == "bullish":
+        bullish_points += 1
+
+    if bias == "bearish":
+        bearish_points += 1
+
+    if bullish_points > bearish_points:
+
+        direction = "bullish"
+
+    elif bearish_points > bullish_points:
+
+        direction = "bearish"
+
+    else:
+
+        return None
+
+    # --------------------------------------------------------
+    # DIRECTION CONFIRMATION
+    # --------------------------------------------------------
+
+    if direction == "bullish":
+
+        if (
+            displacement == "bearish"
+            and structure == "bearish"
+            and sweep != "bullish"
+        ):
+            return None
+
+    if direction == "bearish":
+
+        if (
+            displacement == "bullish"
+            and structure == "bullish"
+            and sweep != "bearish"
+        ):
+            return None
+
+    # --------------------------------------------------------
+    # MINIMUM SCORE
+    # --------------------------------------------------------
+
+    if score < config["minimum_score"]:
+        return None
+
+    # --------------------------------------------------------
+    # TRADE LEVELS
+    # --------------------------------------------------------
+
+    levels = calculate_trade_levels(
+        candles,
+        index,
+        direction,
+        config
+    )
+
+    if levels is None:
+        return None
+
+    return Signal(
+        direction=(
+            "BUY"
+            if direction == "bullish"
+            else "SELL"
+        ),
+
+        score=min(score, 100),
+
+        entry=levels["entry"],
+
+        stop_loss=levels["stop_loss"],
+
+        take_profit=levels["take_profit"],
+
+        risk_distance=levels["risk_distance"],
+
+        reward_distance=levels["reward_distance"],
+
+        risk_reward=levels["risk_reward"],
+
+        timestamp=current.timestamp,
+
+        flags=flags,
+
+        reasons=reasons,
+    )
+
+
+# ============================================================
+# MARKET SCANNER
+# ============================================================
+
+def scan_market(
+    candles: List[Candle],
+    config: Optional[dict] = None
+):
+
+    signal = detect_signal(
+        candles,
+        config=config
+    )
+
+    if signal is None:
+
+        return {
+            "signal": "WAIT",
+            "score": 0,
+            "message": "No valid high-quality setup.",
+        }
+
+    return {
+        "signal": signal.direction,
+        "score": signal.score,
+        "entry": signal.entry,
+        "stop_loss": signal.stop_loss,
+        "take_profit": signal.take_profit,
+        "risk_reward": signal.risk_reward,
+        "reasons": signal.reasons,
+        "flags": signal.flags,
+        "timestamp": signal.timestamp.isoformat(),
+    }
+
+
+# ============================================================
+# SIMPLE TEST
+# ============================================================
+
+if __name__ == "__main__":
+
+    print(
+        "SMC/ICT strategy engine loaded successfully."
+    )
+
+    print(
+        "Paper trading / backtesting mode only."
+    )
